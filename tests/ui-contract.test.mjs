@@ -162,3 +162,32 @@ test('page has the Clippy tab title and favicon', () => {
   assert.match(html, /rel="icon" type="image\/svg\+xml" href="\.\/src\/icons\/favicon\.svg"/);
   assert.match(html, /rel="apple-touch-icon"/);
 });
+
+test('composer accepts dropped or picked files with progress and shows the file limits', () => {
+  assert.match(input, /@drop="onDrop"/);
+  assert.match(input, /aria-label="Attach files"/);
+  assert.match(input, /type="file" multiple/);
+  assert.match(input, /role="progressbar"/);
+  assert.match(input, /class="file-limits"/);
+  assert.match(input, /uploadInlineImages/);
+  assert.match(input, /attachments: this\.readyAttachments/);
+});
+
+test('entries list their files with download and curl commands; guide documents files', () => {
+  assert.match(message, /class="entry-files"/);
+  assert.match(message, /\?download`/);
+  assert.match(message, /curl -skOJ/);
+  assert.match(message, /portableHtml\(\)/);
+  assert.match(guide, /upload\//);
+  assert.match(guide, /messages\/12\/files\/1/);
+  assert.match(app, /:limits="limits"/);
+});
+
+test('backend streams uploads to disk with configurable limits', () => {
+  assert.match(server, /app\.put\('\/api\/files\/:name'/);
+  assert.match(server, /app\.put\('\/api\/upload\/:name'/);
+  assert.match(server, /MAX_FILE_BYTES/);
+  assert.match(server, /MAX_FILES_BYTES/);
+  assert.match(server, /FILES_PATH/);
+  assert.doesNotMatch(server, /app\.post\('\/api\/(files|upload)/);
+});

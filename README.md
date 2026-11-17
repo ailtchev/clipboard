@@ -72,7 +72,7 @@
 
 ## Keep your entries
 
-Entries are stored in `/data/database.sqlite` inside the container. Mount a volume so they survive container re-creation:
+Entries are stored in `/data/database.sqlite` and attached files (including pasted images) in `/data/files/` inside the container. Mount a volume so both survive container re-creation, and back up the whole folder:
 
 ```yaml
 services:
@@ -95,14 +95,18 @@ services:
 * **Guide** (top right) opens a short in-app user guide.
 * Use the sun/moon button to switch between light and dark themes; your browser remembers the choice.
 * Pin important entries at the top of the list. Pinned entries intentionally bypass `RETENTION_TIME` and remain stored until they are unpinned or manually deleted.
-* Use the search field to filter for specific content
+* Use the search field to filter for specific content, including file names.
+* Drop files onto **Compose** (or use the paperclip) to attach them to the new entry, with or without text. The size limits and free storage are shown under the composer. Files appear under the entry with a download link and a button that copies a `curl` download command.
+* Files and pasted images are stored on disk in `/data/files/`, not in the database. Identical files are stored once; files are deleted with their entry (including by `RETENTION_TIME`), and pinned entries keep theirs.
 
 ## Command line (curl)
 
 ```bash
 some-command | curl -s -T - http://<server>:3000/api/text     # save output, prints "#13"
 curl -s http://<server>:3000/api/latest.txt                     # print the newest entry
-curl -s http://<server>:3000/api/messages/13.txt                # print entry #13
+curl -s http://<server>:3000/api/messages/13.txt                # print entry #13 (and its files' download links)
+curl -s -T capture.pcap http://<server>:3000/api/upload/        # attach a file to a new entry, prints "#14"
+curl -s -OJ http://<server>:3000/api/messages/14/files/1        # download the first file of entry #14
 ```
 
 Clicking an entry's `#id` in the web page copies the matching `curl` command.
@@ -122,14 +126,20 @@ labels:
   - "traefik.http.services.clipboard.loadbalancer.server.port=3000"
 ```
 
+Traefik does not limit request body size by default. With nginx, raise `client_max_body_size` to at least `MAX_FILE_BYTES` for file uploads.
+
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `RETENTION_TIME` | `0` (keep forever) | Delete unpinned entries older than this: `90m`, `36h`, `10d`, `2w`; a bare number means days. Pinned entries are exempt until unpinned. |
 | `MAX_ENTRY_BYTES` | `10485760` | Maximum size of one entry |
-| `MAX_IMAGE_BYTES` | `5242880` | Maximum size of one embedded image |
-| `MAX_DATABASE_BYTES` | `262144000` | Total storage limit |
+| `MAX_IMAGE_BYTES` | `5242880` | Maximum size of an image embedded as a `data:` URI by API clients (the web page stores images as files) |
+| `MAX_FILE_BYTES` | `104857600` (100 MB) | Maximum size of one attached file or pasted image |
+| `MAX_FILES_BYTES` | `5368709120` (5 GB) | Total disk space for files; identical files count once |
+| `MAX_FILES_PER_ENTRY` | `20` | Maximum number of attached files per entry |
+| `FILES_PATH` | `files/` next to the database (`/data/files`) | Where files are stored |
+| `MAX_DATABASE_BYTES` | `262144000` | Database size limit (files are counted separately) |
 | `PORT` | `3000` | Listening port |
 
 ## Release

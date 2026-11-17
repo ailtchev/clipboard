@@ -19,17 +19,54 @@
         <i class="bi bi-trash3" aria-hidden="true"></i>
       </button>
     </div>
-    <div ref="content" class="entry-content" :class="{ 'is-clamped': !expanded, 'has-more': overflowing && !expanded }" v-html="safeMessage"></div>
+    <div ref="content" class="entry-content" :class="{ 'is-clamped': !expanded, 'has-more': overflowing && !expanded, 'is-empty': !safeMessage.trim() }" v-html="safeMessage"></div>
     <button v-if="overflowing" class="expand-toggle" type="button" :aria-expanded="expanded" @click="expanded = !expanded">
       <i :class="expanded ? 'bi bi-chevron-up' : 'bi bi-chevron-down'" aria-hidden="true"></i>
       {{ expanded ? 'Show less' : 'Show more' }}
     </button>
-    <span class="visually-hidden" role="status" aria-live="polite">{{ copied ? 'Entry copied to clipboard' : curlCopied ? 'curl command copied' : '' }}</span>
+    <ul v-if="files.length" class="entry-files" aria-label="Attached files">
+      <li v-for="file in files" :key="file.id" class="file-chip">
+        <img v-if="isInlineImage(file.type)" class="file-thumb" :src="file.url" alt="" loading="lazy">
+        <i v-else :class="['bi', 'file-icon', fileIcon(file.type, file.name)]" aria-hidden="true"></i>
+        <a class="file-name" :href="`${file.url}?download`" download :title="`Download ${file.name}`">{{ file.name }}</a>
+        <span class="file-size">{{ formatBytes(file.size) }}</span>
+        <button class="file-curl" type="button" :title="`Copy download command: ${fileCurl(file)}`" :aria-label="`Copy curl download command for ${file.name}`" @click="copyFileCurl(file)">
+          <i :class="copiedFileId === file.id ? 'bi bi-check-lg' : 'bi bi-terminal'" aria-hidden="true"></i>
+        </button>
+      </li>
+    </ul>
+    <span class="visually-hidden" role="status" aria-live="polite">{{ copied ? 'Entry copied to clipboard' : curlCopied || copiedFileId !== null ? 'curl command copied' : '' }}</span>
   </article>
 </template>
 
 <script>
 import DOMPurify from 'dompurify';
+import { formatBytes, fileIcon, isInlineImage } from '../files.mjs';
+
+function blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function copyText(text) {
+  if (navigator.clipboard?.writeText && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const area = document.createElement('textarea');
+  area.value = text;
+  area.setAttribute('readonly', '');
+  area.style.position = 'fixed';
+  area.style.opacity = '0';
+  document.body.appendChild(area);
+  area.select();
+  document.execCommand('copy');
+  area.remove();
+}
 
 export default {
   props: {
@@ -38,9 +75,10 @@ export default {
     createdAt: { type: String, default: '' },
     mono: { type: Boolean, default: false },
     isPinned: { type: Boolean, default: false },
+    files: { type: Array, default: () => [] },
   },
   emits: ['deleteMessage', 'toggleMono', 'togglePin'],
-  data() { return { copied: false, curlCopied: false, expanded: false, overflowing: false }; },
+  data() { return { copied: false, curlCopied: false, copiedFileId: null, expanded: false, overflowing: false }; },
   computed: {
     safeMessage() {
       const sanitized = DOMPurify.sanitize(this.message, { ADD_DATA_URI_TAGS: ['img'] });
@@ -75,6 +113,32 @@ export default {
     this.resizeObserver?.disconnect();
   },
   methods: {
+    formatBytes,
+    fileIcon,
+    isInlineImage,
+    fileCurl(file) {
+      return `curl -skOJ ${new URL(file.url, document.baseURI).href}`;
+    },
+    async copyFileCurl(file) {
+      try {
+        await copyText(this.fileCurl(file));
+        this.copiedFileId = file.id;
+        window.setTimeout(() => { if (this.copiedFileId === file.id) this.copiedFileId = null; }, 1600);
+      } catch (error) { console.error('Unable to copy curl command:', error); }
+    },
+    // Images are stored as files on the server; embed them so a copied entry still pastes with its images elsewhere.
+    async portableHtml() {
+      const doc = new DOMParser().parseFromString(this.safeMessage, 'text/html');
+      await Promise.all([...doc.querySelectorAll('img')].map(async (image) => {
+        const src = image.getAttribute('src') || '';
+        if (!src || src.startsWith('data:')) return;
+        try {
+          const response = await fetch(new URL(src, document.baseURI));
+          if (response.ok) image.setAttribute('src', await blobToDataUrl(await response.blob()));
+        } catch { /* keep the link */ }
+      }));
+      return doc.body.innerHTML;
+    },
     // Overflow can only be measured while clamped; once expanded keep the toggle visible.
     measure() {
       const content = this.$refs.content;
@@ -110,7 +174,7 @@ export default {
       try {
         if (navigator.clipboard?.write && window.ClipboardItem) {
           await navigator.clipboard.write([new ClipboardItem({
-            'text/html': new Blob([this.safeMessage], { type: 'text/html' }),
+            'text/html': this.portableHtml().then((html) => new Blob([html], { type: 'text/html' })),
             'text/plain': new Blob([this.renderedText()], { type: 'text/plain' }),
           })]);
         } else {
@@ -158,4 +222,14 @@ export default {
 .expand-toggle { display: inline-flex; align-items: center; gap: 5px; margin-top: 8px; padding: 3px 10px; border: 1px solid var(--border); border-radius: 999px; color: var(--primary-dark); background: var(--surface-soft); font-size: 12px; font-weight: 700; cursor: pointer; }
 .expand-toggle:hover { color: #fff; background: var(--primary); border-color: var(--primary); }
 .pin-button:has(.bi-pin-angle-fill) { color: #fff; background: var(--primary); }
+.entry-content.is-empty { display: none; }
+.entry-files { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 0; padding: 0; list-style: none; }
+.file-chip { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; padding: 5px 6px 5px 8px; border: 1px solid var(--border); border-radius: 11px; background: var(--surface-soft); font-size: 13px; }
+.file-thumb { width: 34px; height: 34px; object-fit: cover; border-radius: 7px; }
+.file-icon { color: var(--primary); font-size: 18px; }
+.file-name { min-width: 0; overflow: hidden; color: var(--text); font-weight: 600; text-decoration: none; white-space: nowrap; text-overflow: ellipsis; }
+.file-name:hover { color: var(--primary-dark); text-decoration: underline; }
+.file-size { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.file-curl { display: grid; place-items: center; width: 26px; height: 26px; border: 1px solid var(--border); border-radius: 7px; color: var(--muted); background: transparent; cursor: pointer; }
+.file-curl:hover { color: #fff; background: var(--primary); border-color: var(--primary); }
 </style>
