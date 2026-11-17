@@ -19,7 +19,7 @@
         <i class="bi bi-trash3" aria-hidden="true"></i>
       </button>
     </div>
-    <div ref="content" class="entry-content" :class="{ 'is-clamped': !expanded, 'has-more': overflowing && !expanded, 'is-empty': !safeMessage.trim() }" v-html="safeMessage"></div>
+    <div ref="content" class="entry-content" :class="{ 'is-clamped': !expanded, 'has-more': overflowing && !expanded, 'is-empty': !safeMessage.trim() }" v-html="displayHtml"></div>
     <button v-if="overflowing" class="expand-toggle" type="button" :aria-expanded="expanded" @click="expanded = !expanded">
       <i :class="expanded ? 'bi bi-chevron-up' : 'bi bi-chevron-down'" aria-hidden="true"></i>
       {{ expanded ? 'Show less' : 'Show more' }}
@@ -42,6 +42,7 @@
 <script>
 import DOMPurify from 'dompurify';
 import { formatBytes, fileIcon, isInlineImage } from '../files.mjs';
+import { addLinkIcons } from '../linkify.mjs';
 
 function blobToDataUrl(blob) {
   return new Promise((resolve, reject) => {
@@ -85,6 +86,12 @@ export default {
       const fragment = new DOMParser().parseFromString(sanitized, 'text/html');
       fragment.querySelectorAll('img:not([alt])').forEach((image) => image.setAttribute('alt', ''));
       return fragment.body.innerHTML;
+    },
+    // What is shown: the sanitized entry plus a ↗ "open in new tab" icon after each web address.
+    // Copying uses safeMessage, so the icons never end up in the clipboard.
+    displayHtml() {
+      const doc = new DOMParser().parseFromString(this.safeMessage, 'text/html');
+      return addLinkIcons(doc).body.innerHTML;
     },
     plainText() {
       const fragment = new DOMParser().parseFromString(this.safeMessage, 'text/html');
@@ -223,6 +230,8 @@ export default {
 .expand-toggle:hover { color: #fff; background: var(--primary); border-color: var(--primary); }
 .pin-button:has(.bi-pin-angle-fill) { color: #fff; background: var(--primary); }
 .entry-content.is-empty { display: none; }
+.entry-content .link-open { display: inline-flex; align-items: center; margin: 0 2px 0 4px; padding: 1px 4px; border-radius: 5px; color: var(--primary); font-size: .78em; line-height: 1; text-decoration: none; vertical-align: 1px; white-space: nowrap; transition: color .15s ease, background .15s ease; }
+.entry-content .link-open:hover, .entry-content .link-open:focus-visible { color: #fff; background: var(--primary); }
 .entry-files { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 0; padding: 0; list-style: none; }
 .file-chip { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; padding: 5px 6px 5px 8px; border: 1px solid var(--border); border-radius: 11px; background: var(--surface-soft); font-size: 13px; }
 .file-thumb { width: 34px; height: 34px; object-fit: cover; border-radius: 7px; }

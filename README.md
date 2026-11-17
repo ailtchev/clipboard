@@ -96,6 +96,7 @@ services:
 * Use the sun/moon button to switch between light and dark themes; your browser remembers the choice.
 * Pin important entries at the top of the list. Pinned entries intentionally bypass `RETENTION_TIME` and remain stored until they are unpinned or manually deleted.
 * Use the search field to filter for specific content, including file names.
+* Every web address in an entry gets a small ↗ icon that opens it in a new tab; links never replace the Clippy page. The stored text is unchanged, so copying an entry gives exactly what was pasted.
 * Drop files onto **Compose** (or use the paperclip) to attach them to the new entry, with or without text. The size limits and free storage are shown under the composer. Files appear under the entry with a download link and a button that copies a `curl` download command.
 * Files and pasted images are stored on disk in `/data/files/`, not in the database. Identical files are stored once; files are deleted with their entry (including by `RETENTION_TIME`), and pinned entries keep theirs.
 

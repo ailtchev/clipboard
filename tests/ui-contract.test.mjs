@@ -191,3 +191,19 @@ test('backend streams uploads to disk with configurable limits', () => {
   assert.match(server, /FILES_PATH/);
   assert.doesNotMatch(server, /app\.post\('\/api\/(files|upload)/);
 });
+
+test('web addresses get an open-in-new-tab icon at display time only', async () => {
+  const { findUrls } = await import('../src/linkify.mjs');
+  const urls = (text) => findUrls(text).map((found) => found.url);
+  assert.deepEqual(urls('PR https://github.com/sudipmandal/clipboard/pull/7'), ['https://github.com/sudipmandal/clipboard/pull/7']);
+  assert.deepEqual(urls('see (https://a.example/x). next'), ['https://a.example/x']);
+  assert.deepEqual(urls('https://en.wikipedia.org/wiki/Foo_(bar), ok'), ['https://en.wikipedia.org/wiki/Foo_(bar)']);
+  assert.deepEqual(urls('http://10.0.0.1:8080/api?x=1&y=2 | sh'), ['http://10.0.0.1:8080/api?x=1&y=2']);
+  assert.deepEqual(urls('javascript:alert(1) file:///etc/passwd ftp://x https://'), []);
+  const linkify = readFileSync(new URL('../src/linkify.mjs', import.meta.url), 'utf8');
+  assert.match(linkify, /rel = 'noopener noreferrer'/);
+  assert.match(linkify, /target = '_blank'/);
+  assert.match(message, /v-html="displayHtml"/);
+  assert.match(message, /new Blob\(\[this\.renderedText\(\)\]/);
+  assert.match(message, /parseFromString\(this\.safeMessage, 'text\/html'\);\s*await Promise\.all/);
+});
