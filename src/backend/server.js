@@ -114,7 +114,8 @@ function purgeExpired() {
     if (RETENTION_SECONDS > 0) {
       removed += (await run("DELETE FROM messages WHERE created_at < datetime('now', ?) AND is_pinned = 0", [`-${RETENTION_SECONDS} seconds`])).changes;
     }
-    removed += (await run("DELETE FROM messages WHERE deleted_at IS NOT NULL AND deleted_at < datetime('now', ?)", [`-${DELETED_ENTRY_PURGE_SECONDS} seconds`])).changes;
+    // deleted_at is an ISO string ("…T…Z"); compare as dates, not text, or same-day rows never match datetime('now', …)
+    removed += (await run("DELETE FROM messages WHERE deleted_at IS NOT NULL AND julianday(deleted_at) < julianday('now', ?)", [`-${DELETED_ENTRY_PURGE_SECONDS} seconds`])).changes;
     if (removed) {
       await run('VACUUM');
       console.log(`Purged ${removed} expired or deleted entr${removed === 1 ? 'y' : 'ies'}`);
