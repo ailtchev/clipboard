@@ -119,6 +119,13 @@ const AUTO_REFRESH_MS = 3000;
 const AUTO_REFRESH_KEY = 'clippy.autoRefresh';
 const UNDO_TOAST_MS = 8000;
 
+// Fast 32-bit FNV-1a hash, only used to notice that an entry changed between two refreshes.
+function textHash(text) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) hash = Math.imul(hash ^ text.charCodeAt(i), 0x01000193);
+  return (hash >>> 0).toString(36);
+}
+
 function readAutoRefreshSetting() {
   try { return window.localStorage.getItem(AUTO_REFRESH_KEY) === '1'; } catch { return false; }
 }
@@ -169,7 +176,11 @@ export default {
         const response = await fetch('api/messages', { cache: 'no-store' });
         if (!response.ok) throw new Error(`Load failed (${response.status})`);
         const rows = await response.json();
-        const signature = (list) => list.map((entry) => `${entry.id}:${entry.mono ? 1 : 0}:${entry.is_pinned ? 1 : 0}`).join(',');
+        // Any visible change counts: text, flags and attached files (search also matches file names).
+        const signature = (list) => list.map((entry) => [
+          entry.id, entry.mono ? 1 : 0, entry.is_pinned ? 1 : 0, textHash(entry.message),
+          (entry.files || []).map((file) => `${file.id}/${file.name}/${file.size}`).join('|'),
+        ].join(':')).join('\n');
         if (signature(rows) !== signature(this.messages)) {
           this.messages = rows;
           this.fetchConfig(); // storage use may have changed

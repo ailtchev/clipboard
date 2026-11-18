@@ -213,3 +213,8 @@ test('composer claims its uploads with their tokens', () => {
   assert.match(input, /inlineUploads: claims/);
   assert.match(input, /'X-Upload-Token': item\.token/);
 });
+
+test('auto-refresh notices changed text and attached files', () => {
+  assert.match(app, /textHash\(entry\.message\)/);
+  assert.match(app, /file\.id\}\/\$\{file\.name\}\/\$\{file\.size/);
+});
