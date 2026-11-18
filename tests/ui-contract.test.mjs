@@ -127,7 +127,7 @@ test('entries show #id with a curl pull command, a mono toggle and a collapse co
   assert.match(message, /class="mono-toggle"[^>]*:aria-pressed="mono"/);
   assert.match(message, /class="expand-toggle"[^>]*:aria-expanded="expanded"/);
   assert.match(message, /max-height: 20lh/);
-  assert.match(message, /\$refs\.content\?\.innerText/);
+  assert.match(message, /withStoredCopy\(\(holder\) => holder\.innerText\)/); // plain text keeps line breaks
 });
 
 test('deletes can be undone and new CLI-looking entries are sent as monospace', () => {
@@ -217,4 +217,14 @@ test('composer claims its uploads with their tokens', () => {
 test('auto-refresh notices changed text and attached files', () => {
   assert.match(app, /textHash\(entry\.message\)/);
   assert.match(app, /file\.id\}\/\$\{file\.name\}\/\$\{file\.size/);
+});
+
+test('link icons stay glued to the address and punctuation, and copies never include them', () => {
+  const linkify = readFileSync(new URL('../src/linkify.mjs', import.meta.url), 'utf8');
+  assert.match(linkify, /tail\.className = 'link-tail'/);
+  assert.match(message, /\.link-tail \{ white-space: nowrap; \}/);
+  assert.match(message, /holder\.innerHTML = this\.safeMessage/);
+  assert.match(message, /\.link-open \{ display: inline-block;/); // inline-flex would add a line break to innerText
+  assert.match(message, /withStoredCopy\(\(holder\) => holder\.innerText\)/);
+  assert.doesNotMatch(message, /selectNodeContents\(this\.\$el\.querySelector\('\.entry-content'\)\)/);
 });

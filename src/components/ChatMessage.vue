@@ -171,10 +171,22 @@ export default {
         window.setTimeout(() => { this.curlCopied = false; }, 1600);
       } catch (error) { console.error('Unable to copy curl command:', error); }
     },
-    // innerText of the rendered entry keeps line breaks (<br>/<div>) and, in mono mode, spacing;
-    // an unrendered DOMParser document would flatten everything onto one line.
+    // Renders the entry as stored (without the display-only link icons) in an off-screen element.
+    // innerText needs a rendered element to keep line breaks (<br>/<div>) and, in mono mode, spacing.
+    withStoredCopy(use) {
+      const holder = document.createElement('div');
+      holder.className = 'copy-holder';
+      holder.innerHTML = this.safeMessage;
+      holder.style.cssText = `position: fixed; left: -10000px; top: 0; white-space: ${this.mono ? 'pre-wrap' : 'normal'};`;
+      document.body.appendChild(holder);
+      try {
+        return use(holder);
+      } finally {
+        holder.remove();
+      }
+    },
     renderedText() {
-      return this.$refs.content?.innerText || this.plainText;
+      return this.withStoredCopy((holder) => holder.innerText) || this.plainText;
     },
     deleteMessage() { this.$emit('deleteMessage', this.id); },
     async copyToClipboard() {
@@ -185,13 +197,16 @@ export default {
             'text/plain': new Blob([this.renderedText()], { type: 'text/plain' }),
           })]);
         } else {
-          const range = document.createRange();
-          range.selectNodeContents(this.$el.querySelector('.entry-content'));
-          const selection = window.getSelection();
-          selection.removeAllRanges();
-          selection.addRange(range);
-          document.execCommand('copy');
-          selection.removeAllRanges();
+          // Copy the entry as stored, not the displayed one (which carries the link icons).
+          this.withStoredCopy((holder) => {
+            const range = document.createRange();
+            range.selectNodeContents(holder);
+            const selection = window.getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+            document.execCommand('copy');
+            selection.removeAllRanges();
+          });
         }
         this.copied = true;
         window.setTimeout(() => { this.copied = false; }, 1600);
@@ -230,7 +245,8 @@ export default {
 .expand-toggle:hover { color: #fff; background: var(--primary); border-color: var(--primary); }
 .pin-button:has(.bi-pin-angle-fill) { color: #fff; background: var(--primary); }
 .entry-content.is-empty { display: none; }
-.entry-content .link-open { display: inline-flex; align-items: center; margin: 0 2px 0 4px; padding: 1px 4px; border-radius: 5px; color: var(--primary); font-size: .78em; line-height: 1; text-decoration: none; vertical-align: 1px; white-space: nowrap; transition: color .15s ease, background .15s ease; }
+.entry-content .link-tail { white-space: nowrap; }
+.entry-content .link-open { display: inline-block; margin: 0 2px 0 4px; padding: 1px 4px; border-radius: 5px; color: var(--primary); font-size: .78em; line-height: 1; text-decoration: none; vertical-align: 1px; white-space: nowrap; transition: color .15s ease, background .15s ease; }
 .entry-content .link-open:hover, .entry-content .link-open:focus-visible { color: #fff; background: var(--primary); }
 .entry-files { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 0; padding: 0; list-style: none; }
 .file-chip { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; padding: 5px 6px 5px 8px; border: 1px solid var(--border); border-radius: 11px; background: var(--surface-soft); font-size: 13px; }

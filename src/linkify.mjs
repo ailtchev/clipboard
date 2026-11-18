@@ -62,7 +62,9 @@ export function addLinkIcons(doc) {
     if (!isWebUrl(href)) continue;
     anchor.target = '_blank';
     anchor.rel = 'noopener noreferrer';
-    anchor.after(openIcon(doc, href));
+    const icon = openIcon(doc, href);
+    anchor.after(icon);
+    gluePunctuation(doc, icon);
   }
   // Plain-text addresses: the text stays as it is, the icon is inserted right after it.
   const walker = doc.createTreeWalker(doc.body, 4 /* NodeFilter.SHOW_TEXT */);
@@ -73,9 +75,31 @@ export function addLinkIcons(doc) {
   for (const node of textNodes) {
     const urls = findUrls(node.data);
     for (const { end, url } of urls.reverse()) {
-      const rest = node.splitText(end); // node keeps the text up to and including the address
-      rest.before(openIcon(doc, url));
+      // [text … addres][s ↗ .][rest]: the last character of the address, the icon and any punctuation right
+      // after it share a no-wrap span, so the icon never starts a line or pushes the punctuation onto the next one.
+      const lastChar = node.splitText(end - 1);
+      const after = lastChar.splitText(1);
+      const punctuation = /^[.,;:!?)\]}'"»]+/.exec(after.data)?.[0] || '';
+      if (punctuation) after.splitText(punctuation.length); // `after` keeps only the punctuation
+      const tail = doc.createElement('span');
+      tail.className = 'link-tail';
+      lastChar.before(tail);
+      tail.append(lastChar, openIcon(doc, url));
+      if (punctuation) tail.append(after);
     }
   }
   return doc;
+}
+
+// Rich-paste links: keep the icon and the punctuation right after it on the same line.
+function gluePunctuation(doc, icon) {
+  const next = icon.nextSibling;
+  if (!next || next.nodeType !== 3) return;
+  const punctuation = /^[.,;:!?)\]}'"»]+/.exec(next.data)?.[0];
+  if (!punctuation) return;
+  next.splitText(punctuation.length); // `next` keeps only the punctuation
+  const tail = doc.createElement('span');
+  tail.className = 'link-tail';
+  icon.before(tail);
+  tail.append(icon, next);
 }
