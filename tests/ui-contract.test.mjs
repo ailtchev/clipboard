@@ -207,3 +207,9 @@ test('web addresses get an open-in-new-tab icon at display time only', async () 
   assert.match(message, /new Blob\(\[this\.renderedText\(\)\]/);
   assert.match(message, /parseFromString\(this\.safeMessage, 'text\/html'\);\s*await Promise\.all/);
 });
+
+test('composer claims its uploads with their tokens', () => {
+  assert.match(input, /attachments: this\.readyAttachments\.map\(\(item\) => \(\{ id: item\.id, token: item\.token \}\)\)/);
+  assert.match(input, /inlineUploads: claims/);
+  assert.match(input, /'X-Upload-Token': item\.token/);
+});

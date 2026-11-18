@@ -166,7 +166,7 @@ export default {
       const maxFile = this.limits?.maxFileBytes ?? Infinity;
       const maxCount = this.limits?.maxFilesPerEntry ?? Infinity;
       for (const file of Array.from(fileList || [])) {
-        const item = { key: (attachmentKey += 1), name: file.name, size: file.size, type: file.type, status: 'uploading', progress: 0, error: '', id: null, handle: null };
+        const item = { key: (attachmentKey += 1), name: file.name, size: file.size, type: file.type, status: 'uploading', progress: 0, error: '', id: null, token: null, handle: null };
         this.attachments.push(item);
         const live = this.attachments[this.attachments.length - 1]; // reactive proxy
         if (this.attachments.filter((entry) => entry.status !== 'error').length > maxCount) {
@@ -181,7 +181,7 @@ export default {
     startUpload(item, file) {
       item.handle = uploadFile(file, file.name, (progress) => { item.progress = progress; });
       item.handle.promise
-        .then((stored) => Object.assign(item, { status: 'done', id: stored.id, type: stored.type, progress: 1 }))
+        .then((stored) => Object.assign(item, { status: 'done', id: stored.id, token: stored.token, type: stored.type, progress: 1 }))
         .catch((error) => {
           if (error.cancelled) return;
           Object.assign(item, { status: 'error', error: error.message });
@@ -191,7 +191,9 @@ export default {
     },
     removeAttachment(item) {
       item.handle?.abort();
-      if (item.status === 'done' && item.id) fetch(`api/files/${item.id}`, { method: 'DELETE' }).catch(() => {});
+      if (item.status === 'done' && item.id) {
+        fetch(`api/files/${item.id}`, { method: 'DELETE', headers: { 'X-Upload-Token': item.token } }).catch(() => {});
+      }
       this.attachments = this.attachments.filter((entry) => entry.key !== item.key);
     },
     // Pasted/inserted images are shown from a blob: URL while composing, then uploaded as files on send.
@@ -214,8 +216,10 @@ export default {
       this.statusMessage = label;
     },
     // Uploads every blob:/data: image of the editor HTML and points it to its stored file.
+    // Returns the rewritten HTML and the [{ id, token }] claims the server needs to link the images.
     async uploadInlineImages(html) {
       const doc = new DOMParser().parseFromString(html, 'text/html');
+      const claims = [];
       for (const image of doc.querySelectorAll('img')) {
         const src = image.getAttribute('src') || '';
         let blob = null;
@@ -226,8 +230,9 @@ export default {
         const name = blob.name || `pasted-image.${imageExtension(blob.type)}`;
         const stored = await uploadFile(blob, name).promise;
         image.setAttribute('src', stored.url);
+        claims.push({ id: stored.id, token: stored.token });
       }
-      return doc.body.innerHTML;
+      return { html: doc.body.innerHTML, claims };
     },
     syncContent() {
       this.message = this.$refs.editor.innerHTML;
@@ -285,14 +290,15 @@ export default {
       this.errorMessage = '';
       this.statusMessage = 'Saving entry';
       try {
-        const html = this.hasContent ? await this.uploadInlineImages(this.message) : '';
+        const { html, claims } = this.hasContent ? await this.uploadInlineImages(this.message) : { html: '', claims: [] };
         const response = await fetch('api/messages', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             text: DOMPurify.sanitize(html),
             mono: !/<img\b/i.test(html) && looksLikeCliOutput(this.$refs.editor.innerText),
-            attachments: this.readyAttachments.map((item) => item.id),
+            attachments: this.readyAttachments.map((item) => ({ id: item.id, token: item.token })),
+            inlineUploads: claims,
           }),
         });
         if (!response.ok) {

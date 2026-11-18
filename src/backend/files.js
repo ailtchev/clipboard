@@ -9,6 +9,7 @@ const fsp = fs.promises;
 const path = require('path');
 
 const SHA256 = /^[0-9a-f]{64}$/;
+const HEAD_BYTES = 32; // enough for every image signature checked below
 
 const EXTENSION_TYPES = {
   png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', avif: 'image/avif', bmp: 'image/bmp', svg: 'image/svg+xml',
@@ -44,6 +45,27 @@ function isInlineImageType(type) {
   return INLINE_IMAGE_TYPES.has(type);
 }
 
+// Image type from the first bytes of the content (magic numbers), or null.
+function sniffImageType(head) {
+  const ascii = (start, end) => head.subarray(start, end).toString('latin1');
+  if (head.length >= 8 && head.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+  if (head.length >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return 'image/jpeg';
+  if (head.length >= 6 && /^GIF8[79]a$/.test(ascii(0, 6))) return 'image/gif';
+  if (head.length >= 12 && ascii(0, 4) === 'RIFF' && ascii(8, 12) === 'WEBP') return 'image/webp';
+  if (head.length >= 12 && ascii(4, 8) === 'ftyp' && /^avi[fs]$/.test(ascii(8, 12))) return 'image/avif';
+  if (head.length >= 18 && ascii(0, 2) === 'BM' && [12, 40, 52, 56, 108, 124].includes(head.readUInt32LE(14))) return 'image/bmp';
+  return null;
+}
+
+// Stored type: the sniffed image type when the content is an image; a name or header that only
+// claims to be an inline image is downgraded to a plain download.
+function resolveType(name, declared, head) {
+  const sniffed = sniffImageType(head);
+  if (sniffed) return sniffed;
+  const guessed = guessType(name, declared);
+  return isInlineImageType(guessed) ? 'application/octet-stream' : guessed;
+}
+
 function contentDisposition(name, inline) {
   const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
   const encoded = encodeURIComponent(name).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
@@ -76,6 +98,8 @@ class FileStore {
     return new Promise((resolve, reject) => {
       const hash = crypto.createHash('sha256');
       const out = fs.createWriteStream(tmp, { flags: 'wx' });
+      const headChunks = [];
+      let headBytes = 0;
       let size = 0;
       let settled = false;
       const fail = (error) => {
@@ -89,8 +113,15 @@ class FileStore {
       };
       req.on('data', (chunk) => {
         size += chunk.length;
-        if (size > maxBytes) fail(httpError(413, 'File is too large'));
-        else hash.update(chunk);
+        if (size > maxBytes) {
+          fail(httpError(413, 'File is too large'));
+          return;
+        }
+        hash.update(chunk);
+        if (headBytes < HEAD_BYTES) {
+          headChunks.push(chunk.subarray(0, HEAD_BYTES - headBytes));
+          headBytes += Math.min(chunk.length, HEAD_BYTES - headBytes);
+        }
       });
       req.on('close', () => { if (!req.complete) fail(httpError(400, 'Upload interrupted')); });
       req.on('error', fail);
@@ -98,7 +129,7 @@ class FileStore {
       out.on('finish', () => {
         if (settled) return;
         settled = true;
-        resolve({ tmp, size, sha256: hash.digest('hex') });
+        resolve({ tmp, size, sha256: hash.digest('hex'), head: Buffer.concat(headChunks) });
       });
       req.pipe(out);
     });
@@ -127,6 +158,21 @@ class FileStore {
 
   discard(tmp) {
     return fsp.rm(tmp, { force: true });
+  }
+
+  remove(sha256) {
+    return fsp.rm(this.pathFor(sha256), { force: true });
+  }
+
+  async readHead(sha256) {
+    const handle = await fsp.open(this.pathFor(sha256), 'r');
+    try {
+      const buffer = Buffer.alloc(HEAD_BYTES);
+      const { bytesRead } = await handle.read(buffer, 0, HEAD_BYTES, 0);
+      return buffer.subarray(0, bytesRead);
+    } finally {
+      await handle.close();
+    }
   }
 
   // Deletes stored files whose hash is not in `keep`. Returns the number of files removed.
@@ -162,4 +208,4 @@ class FileStore {
   }
 }
 
-module.exports = { FileStore, sanitizeFileName, guessType, isInlineImageType, contentDisposition, httpError };
+module.exports = { FileStore, sanitizeFileName, guessType, isInlineImageType, sniffImageType, resolveType, contentDisposition, httpError };

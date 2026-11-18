@@ -1,9 +1,10 @@
+const crypto = require('crypto');
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const fs = require('fs');
 const path = require('path');
 const { parseDuration, formatDuration, formatBytes, plainTextToHtml, htmlToPlainText } = require('./text');
-const { FileStore, sanitizeFileName, guessType, isInlineImageType, contentDisposition, httpError } = require('./files');
+const { FileStore, sanitizeFileName, isInlineImageType, sniffImageType, resolveType, contentDisposition, httpError } = require('./files');
 
 const app = express();
 const port = positiveInteger(process.env.PORT, 3000);
@@ -74,20 +75,94 @@ async function initDatabase() {
   if (!columns.includes('mono')) await run('ALTER TABLE messages ADD COLUMN mono INTEGER NOT NULL DEFAULT 0');
   if (!columns.includes('deleted_at')) await run('ALTER TABLE messages ADD COLUMN deleted_at DATETIME');
   if (!columns.includes('is_pinned')) await run('ALTER TABLE messages ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0');
-  // message_id NULL = uploaded in the composer, not sent yet. inline = image shown inside the entry text.
-  await run(`CREATE TABLE IF NOT EXISTS attachments (
+  await migrateAttachments();
+  await run('PRAGMA foreign_keys = ON'); // attachments follow their entry when it is purged
+  await fileStore.init();
+}
+
+// message_id NULL = uploaded in the composer, not sent yet; such a row can only be claimed with the
+// token returned by the upload (claim_hash = its SHA-256). inline = image shown inside the entry text.
+const ATTACHMENTS_SCHEMA = `CREATE TABLE attachments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id INTEGER,
-    sha256 TEXT NOT NULL,
-    name TEXT NOT NULL,
+    message_id INTEGER REFERENCES messages (id) ON DELETE CASCADE,
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+    name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 255),
     type TEXT NOT NULL,
-    size INTEGER NOT NULL,
-    inline INTEGER NOT NULL DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
+    size INTEGER NOT NULL CHECK (size >= 0),
+    inline INTEGER NOT NULL DEFAULT 0 CHECK (inline IN (0, 1)),
+    claim_hash TEXT CHECK (claim_hash IS NULL OR length(claim_hash) = 64),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    CHECK (message_id IS NOT NULL OR claim_hash IS NOT NULL)
+  )`;
+
+// Creates the attachments table, or rebuilds one created without constraints and claim tokens.
+async function migrateAttachments() {
+  const existing = await get("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'attachments'");
+  if (!existing) {
+    await run(ATTACHMENTS_SCHEMA);
+  } else if (!existing.sql.includes('claim_hash')) {
+    await run('BEGIN IMMEDIATE');
+    try {
+      await run('ALTER TABLE attachments RENAME TO attachments_old');
+      await run(ATTACHMENTS_SCHEMA);
+      // Unsent uploads of the old schema have no claim token: only files linked to an entry are kept.
+      await run(`INSERT INTO attachments (id, message_id, sha256, name, type, size, inline, created_at)
+        SELECT id, message_id, sha256, substr(name, 1, 255), type, size, inline, created_at FROM attachments_old
+        WHERE message_id IN (SELECT id FROM messages) AND length(sha256) = 64 AND size >= 0`);
+      await run('DROP TABLE attachments_old');
+      await run('COMMIT');
+    } catch (error) {
+      await run('ROLLBACK').catch(() => {});
+      throw error;
+    }
+  }
   await run('CREATE INDEX IF NOT EXISTS attachments_message ON attachments (message_id)');
   await run('CREATE INDEX IF NOT EXISTS attachments_sha256 ON attachments (sha256)');
-  await fileStore.init();
+}
+
+// Runs inside enqueueWrite: all writes share one connection and are serialized.
+async function inTransaction(work) {
+  await run('BEGIN IMMEDIATE');
+  try {
+    const result = await work();
+    await run('COMMIT');
+    return result;
+  } catch (error) {
+    await run('ROLLBACK').catch(() => {});
+    throw error;
+  }
+}
+
+function newClaimToken() {
+  return crypto.randomBytes(24).toString('base64url');
+}
+
+function tokenHash(token) {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function tokenMatches(hash, token) {
+  if (!hash || typeof token !== 'string' || !token) return false;
+  const expected = Buffer.from(hash, 'hex');
+  const given = Buffer.from(tokenHash(token), 'hex');
+  return expected.length === given.length && crypto.timingSafeEqual(expected, given);
+}
+
+// [{ id, token }] from a request body; anything else is ignored.
+function parseClaims(value) {
+  const claims = new Map();
+  for (const item of Array.isArray(value) ? value : []) {
+    const id = Number(item?.id);
+    if (Number.isSafeInteger(id) && id > 0 && typeof item?.token === 'string') claims.set(id, item.token);
+  }
+  return [...claims].map(([id, token]) => ({ id, token }));
+}
+
+async function verifyClaims(claims) {
+  for (const { id, token } of claims) {
+    const row = await get('SELECT claim_hash FROM attachments WHERE id = ? AND message_id IS NULL', [id]);
+    if (!row || !tokenMatches(row.claim_hash, token)) throw httpError(409, 'An attached file is no longer available, attach it again');
+  }
 }
 
 function enqueueWrite(task) {
@@ -138,22 +213,22 @@ async function filesBytesUsed() {
 // <img src="api/files/<id>/…"> (relative or absolute) inside entry HTML.
 const INLINE_FILE_SRC = /(<img\b[^>]*?\bsrc\s*=\s*)(["'])(?:[^"']*?\/)?api\/files\/(\d+)\/[^"']*\2/gi;
 
-// Links the pending uploads (attachmentIds) and the inline images referenced by the HTML to a new entry.
+// Links the claimed uploads to a new entry: attachments as files, inlineUploads as images referenced by the HTML.
 // An image copied from another entry gets its own attachment row so each entry owns what it shows.
-async function linkFiles(messageId, html, attachmentIds) {
-  if (attachmentIds.length) {
-    await run(
-      `UPDATE attachments SET message_id = ?, inline = 0 WHERE message_id IS NULL AND id IN (${attachmentIds.map(() => '?').join(',')})`,
-      [messageId, ...attachmentIds],
-    );
+// Another client's unsent upload is never linked, even if its id appears in the HTML.
+async function linkFiles(messageId, html, attachments, inlineUploads) {
+  for (const { id } of attachments) {
+    await run('UPDATE attachments SET message_id = ?, inline = 0, claim_hash = NULL WHERE id = ? AND message_id IS NULL', [messageId, id]);
   }
+  const claimedInline = new Set(inlineUploads.map((claim) => claim.id));
   const referenced = [...new Set([...html.matchAll(INLINE_FILE_SRC)].map((match) => Number(match[3])))];
   const remap = new Map();
   for (const fileId of referenced) {
     const row = await get('SELECT id, message_id, sha256, name, type, size FROM attachments WHERE id = ?', [fileId]);
     if (!row || !isInlineImageType(row.type)) continue;
     if (row.message_id === null) {
-      await run('UPDATE attachments SET message_id = ?, inline = 1 WHERE id = ?', [messageId, row.id]);
+      if (!claimedInline.has(fileId)) continue;
+      await run('UPDATE attachments SET message_id = ?, inline = 1, claim_hash = NULL WHERE id = ?', [messageId, row.id]);
       remap.set(fileId, row);
     } else if (row.message_id !== messageId) {
       const copy = await run(
@@ -174,40 +249,36 @@ function entryId(value) {
   return /^\d+$/.test(value) ? Number(value) : null;
 }
 
-// Validates, checks the storage cap inside the serialized write queue, inserts. Returns { status, entry } or { status, error }.
-async function insertEntry(html, mono, attachmentIds = []) {
-  const entryBytes = Buffer.byteLength(html, 'utf8');
-  const ids = [...new Set(attachmentIds.filter((id) => Number.isSafeInteger(id) && id > 0))];
-  if (!html.trim() && !ids.length) return { status: 400, error: 'Entry content is required' };
-  if (ids.length > MAX_FILES_PER_ENTRY) return { status: 400, error: `At most ${MAX_FILES_PER_ENTRY} files per entry` };
-  if (entryBytes > MAX_ENTRY_BYTES) return { status: 413, error: 'Entry is too large' };
+// Inserts an entry with its files. Must run inside enqueueWrite + inTransaction; throws httpError on refusal.
+async function writeEntry(html, mono, attachments, inlineUploads) {
+  let currentDatabaseBytes;
+  try {
+    currentDatabaseBytes = databaseBytes();
+  } catch {
+    throw httpError(500, 'Unable to inspect storage');
+  }
+  if (currentDatabaseBytes + Buffer.byteLength(html, 'utf8') + SQLITE_WRITE_OVERHEAD_BYTES > MAX_DATABASE_BYTES) {
+    throw httpError(413, 'Clipboard storage limit reached');
+  }
+  await verifyClaims([...attachments, ...inlineUploads]);
+  const result = await run('INSERT INTO messages (message, mono) VALUES (?, ?)', [html, mono ? 1 : 0]);
+  const linkedHtml = await linkFiles(result.lastID, html, attachments, inlineUploads);
+  if (linkedHtml !== html) await run('UPDATE messages SET message = ? WHERE id = ?', [linkedHtml, result.lastID]);
+  return result.lastID;
+}
+
+// Validates, then writes the entry and links its files in one transaction. Returns { status, entry } or { status, error }.
+async function insertEntry(html, mono, attachments = [], inlineUploads = []) {
+  if (!html.trim() && !attachments.length) return { status: 400, error: 'Entry content is required' };
+  if (attachments.length > MAX_FILES_PER_ENTRY) return { status: 400, error: `At most ${MAX_FILES_PER_ENTRY} files per entry` };
+  if (Buffer.byteLength(html, 'utf8') > MAX_ENTRY_BYTES) return { status: 413, error: 'Entry is too large' };
   if (hasOversizedImage(html)) return { status: 413, error: 'An embedded image is too large' };
-  return enqueueWrite(async () => {
-    let currentDatabaseBytes;
-    try {
-      currentDatabaseBytes = databaseBytes();
-    } catch {
-      return { status: 500, error: 'Unable to inspect storage' };
-    }
-    if (currentDatabaseBytes + entryBytes + SQLITE_WRITE_OVERHEAD_BYTES > MAX_DATABASE_BYTES) {
-      return { status: 413, error: 'Clipboard storage limit reached' };
-    }
-    try {
-      if (ids.length) {
-        const pending = await get(
-          `SELECT COUNT(*) AS n FROM attachments WHERE message_id IS NULL AND id IN (${ids.map(() => '?').join(',')})`,
-          ids,
-        );
-        if (pending.n !== ids.length) return { status: 409, error: 'An attached file is no longer available, attach it again' };
-      }
-      const result = await run('INSERT INTO messages (message, mono) VALUES (?, ?)', [html, mono ? 1 : 0]);
-      const linkedHtml = await linkFiles(result.lastID, html, ids);
-      if (linkedHtml !== html) await run('UPDATE messages SET message = ? WHERE id = ?', [linkedHtml, result.lastID]);
-      return { status: 201, entry: await loadEntry(result.lastID) };
-    } catch {
-      return { status: 500, error: 'Unable to save entry' };
-    }
-  });
+  try {
+    const id = await enqueueWrite(() => inTransaction(() => writeEntry(html, mono, attachments, inlineUploads)));
+    return { status: 201, entry: await loadEntry(id) };
+  } catch (error) {
+    return { status: error.status || 500, error: error.status ? error.message : 'Unable to save entry' };
+  }
 }
 
 // Expired entries (RETENTION_TIME) and soft-deleted entries past the undo window are removed, then the file is compacted.
@@ -308,7 +379,7 @@ app.put('/api/text', textBody, pushText);
 //   PUT /api/files/<name>   composer upload, returns a pending attachment (JSON), linked when the entry is sent
 //   PUT /api/upload/<name>  terminal upload, creates an entry holding the file and prints "#<id>"
 //                           curl -sk -T capture.pcap https://<host>/clipboard/api/upload/
-async function receiveFile(req) {
+async function receiveUpload(req) {
   const name = sanitizeFileName(req.params.name);
   const declared = Number.parseInt(req.headers['content-length'], 10);
   if (declared > MAX_FILE_BYTES) throw httpError(413, `File is larger than the ${formatBytes(MAX_FILE_BYTES)} limit`);
@@ -320,19 +391,37 @@ async function receiveFile(req) {
     if (error.status === 413) throw httpError(413, `File is larger than the ${formatBytes(MAX_FILE_BYTES)} limit`);
     throw error;
   }
+  return { upload, name, type: resolveType(name, req.headers['content-type'], upload.head) };
+}
+
+// Stores an upload atomically: rows are written in a transaction and the file is moved into place as the
+// last step before COMMIT; if anything fails, the transaction is rolled back and a newly added file removed.
+// createEntry: terminal upload, the entry is created first and the file row is born linked to it.
+// Otherwise the row stays unsent and can only be claimed (or deleted) with the returned token.
+function storeUpload({ upload, name, type }, createEntry) {
   return enqueueWrite(async () => {
+    let added = false;
     try {
-      if (!(await fileStore.exists(upload.sha256)) && (await filesBytesUsed()) + upload.size > MAX_FILES_BYTES) {
-        throw httpError(413, `File storage is full (${formatBytes(MAX_FILES_BYTES)})`);
-      }
-      await fileStore.commit(upload.tmp, upload.sha256);
+      return await inTransaction(async () => {
+        if (!(await fileStore.exists(upload.sha256)) && (await filesBytesUsed()) + upload.size > MAX_FILES_BYTES) {
+          throw httpError(413, `File storage is full (${formatBytes(MAX_FILES_BYTES)})`);
+        }
+        const messageId = createEntry ? await writeEntry('', false, [], []) : null;
+        const token = createEntry ? null : newClaimToken();
+        const row = await run(
+          'INSERT INTO attachments (message_id, sha256, name, type, size, claim_hash) VALUES (?, ?, ?, ?, ?, ?)',
+          [messageId, upload.sha256, name, type, upload.size, token && tokenHash(token)],
+        );
+        added = await fileStore.commit(upload.tmp, upload.sha256);
+        return { id: row.lastID, token, messageId, name, type, size: upload.size, url: fileUrl(row.lastID, name) };
+      });
     } catch (error) {
       await fileStore.discard(upload.tmp);
+      if (added && !(await get('SELECT 1 AS found FROM attachments WHERE sha256 = ?', [upload.sha256]))) {
+        await fileStore.remove(upload.sha256);
+      }
       throw error;
     }
-    const type = guessType(name, req.headers['content-type']);
-    const result = await run('INSERT INTO attachments (sha256, name, type, size) VALUES (?, ?, ?, ?)', [upload.sha256, name, type, upload.size]);
-    return { id: result.lastID, name, type, size: upload.size, url: fileUrl(result.lastID, name) };
   });
 }
 
@@ -343,7 +432,9 @@ function uploadFailed(res, error) {
 
 app.put('/api/files/:name', async (req, res) => {
   try {
-    return res.status(201).json(await receiveFile(req));
+    const stored = await storeUpload(await receiveUpload(req), false);
+    const { id, token, name, type, size, url } = stored;
+    return res.status(201).json({ id, token, name, type, size, url });
   } catch (error) {
     const failure = uploadFailed(res, error);
     return res.status(failure.status).json({ error: failure.message });
@@ -352,10 +443,8 @@ app.put('/api/files/:name', async (req, res) => {
 
 app.put('/api/upload/:name', async (req, res) => {
   try {
-    const file = await receiveFile(req);
-    const result = await insertEntry('', false, [file.id]);
-    if (result.error) return res.status(result.status).type('text/plain').send(`${result.error}\n`);
-    return res.status(201).type('text/plain').send(`#${result.entry.id}\n`);
+    const stored = await storeUpload(await receiveUpload(req), true);
+    return res.status(201).type('text/plain').send(`#${stored.messageId}\n`);
   } catch (error) {
     const failure = uploadFailed(res, error);
     return res.status(failure.status).type('text/plain').send(`${failure.message}\n`);
@@ -365,7 +454,14 @@ app.put('/api/upload/:name', async (req, res) => {
 // Downloads: safe image types inline (thumbnails, pasted images), everything else as an attachment.
 async function sendStoredFile(req, res, row) {
   if (!row) return res.status(404).type('text/plain').send('File not found\n');
-  const inline = isInlineImageType(row.type) && req.query.download === undefined;
+  let inline = isInlineImageType(row.type) && req.query.download === undefined;
+  if (inline) {
+    try {
+      inline = sniffImageType(await fileStore.readHead(row.sha256)) === row.type; // the bytes must really be that image
+    } catch {
+      inline = false;
+    }
+  }
   res.set({
     'Cache-Control': 'private, max-age=31536000, immutable',
     'Content-Disposition': contentDisposition(row.name, inline),
@@ -377,8 +473,9 @@ async function sendStoredFile(req, res, row) {
   });
 }
 
-const VISIBLE_FILE = `SELECT a.id, a.sha256, a.name, a.type, a.size FROM attachments a LEFT JOIN messages m ON m.id = a.message_id
-  WHERE (a.message_id IS NULL OR (m.id IS NOT NULL AND m.deleted_at IS NULL))`;
+// Only files of visible entries are served; unsent uploads are private to the composer that sent them.
+const VISIBLE_FILE = `SELECT a.id, a.sha256, a.name, a.type, a.size FROM attachments a JOIN messages m ON m.id = a.message_id
+  WHERE m.deleted_at IS NULL`;
 
 app.get('/api/files/:id/:name', async (req, res) => {
   const id = entryId(req.params.id);
@@ -394,12 +491,14 @@ app.get('/api/messages/:id/files/:index', async (req, res) => {
   return sendStoredFile(req, res, await get(`${VISIBLE_FILE} AND a.message_id = ? AND a.inline = 0 ORDER BY a.id LIMIT 1 OFFSET ?`, [id, index - 1]));
 });
 
-// Removes a composer upload that was not sent (the chip's ✕ button).
+// Removes a composer upload that was not sent (the chip's ✕ button); needs its token in X-Upload-Token.
 app.delete('/api/files/:id', async (req, res) => {
   const id = entryId(req.params.id);
-  if (id === null) return res.status(400).json({ error: 'Invalid file id' });
-  const result = await run('DELETE FROM attachments WHERE id = ? AND message_id IS NULL', [id]);
-  return result.changes ? res.status(204).send() : res.status(404).json({ error: 'File not found' });
+  if (id === null) return res.status(404).json({ error: 'File not found' });
+  const row = await get('SELECT claim_hash FROM attachments WHERE id = ? AND message_id IS NULL', [id]);
+  if (!row || !tokenMatches(row.claim_hash, req.get('x-upload-token'))) return res.status(404).json({ error: 'File not found' });
+  await enqueueWrite(() => run('DELETE FROM attachments WHERE id = ? AND message_id IS NULL', [id]));
+  return res.status(204).send();
 });
 
 app.use(express.json({ limit: MAX_ENTRY_BYTES }));
@@ -438,8 +537,8 @@ app.get('/api/messages', async (req, res) => {
 
 app.post('/api/messages', async (req, res) => {
   const text = typeof req.body?.text === 'string' ? req.body.text : '';
-  const attachments = Array.isArray(req.body?.attachments) ? req.body.attachments.map(Number) : [];
-  const result = await insertEntry(text, req.body?.mono === true, attachments);
+  // attachments / inlineUploads: [{ id, token }] as returned by PUT /api/files/<name>
+  const result = await insertEntry(text, req.body?.mono === true, parseClaims(req.body?.attachments), parseClaims(req.body?.inlineUploads));
   if (result.error) return res.status(result.status).json({ error: result.error });
   return res.status(result.status).json(result.entry);
 });

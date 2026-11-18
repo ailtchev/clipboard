@@ -32,7 +32,8 @@ export function fileIcon(type = '', name = '') {
   return 'bi-file-earmark-binary';
 }
 
-// PUT the raw file to api/files/<name>; resolves to the pending attachment { id, name, type, size, url }.
+// PUT the raw file to api/files/<name>; resolves to the unsent upload { id, token, name, type, size, url }.
+// The token is the only way to attach (or delete) it: keep it with the upload, never display it.
 // XMLHttpRequest instead of fetch because only XHR reports upload progress.
 export function uploadFile(blob, name, onProgress) {
   const xhr = new XMLHttpRequest();
